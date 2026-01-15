@@ -538,6 +538,8 @@ mod tests {
     use crate::assert_optimized_plan_eq_display_indent_snapshot;
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion_expr::builder::table_source;
+    use datafusion_expr::scalar_subquery;
+    use datafusion_expr::test::function_stub::avg;
     use datafusion_expr::{and, binary_expr, col, lit, not, out_ref_col, table_scan};
 
     macro_rules! assert_optimized_plan_equal {
@@ -1563,6 +1565,68 @@ mod tests {
         )
     }
 
+    #[test]
+    fn test_outer_ref_from_non_adjacent_outer_relation() -> Result<()> {
+        // Construct query plan for the following SQL:
+        // SELECT
+        //     o1.O_ORDERKEY,
+        //     o1.O_TOTALPRICE,
+        //     o1.O_ORDERSTATUS
+        // FROM
+        //     ORDERS o1
+        // WHERE
+        //     o1.O_TOTALPRICE > (
+        //         SELECT AVG(o2.O_TOTALPRICE)
+        //         FROM ORDERS o2
+        //         WHERE o2.O_ORDERSTATUS = o1.O_ORDERSTATUS
+        //         AND o2.O_TOTALPRICE > (
+        //             SELECT AVG(o3.O_TOTALPRICE)
+        //             FROM ORDERS o3
+        //             WHERE o3.O_ORDERSTATUS = o1.O_ORDERSTATUS
+        //         )
+        //     );
+
+        // Level 3: Inner-most average (o3)
+        // Correlates to o1.O_ORDERSTATUS
+        let sq_inner = Arc::new(
+            LogicalPlanBuilder::from(scan_tpch_table("orders"))
+                .alias("o3")?
+                .filter(
+                    col("o3.o_orderstatus")
+                        .eq(out_ref_col(DataType::Utf8, "o1.o_orderstatus")),
+                )?
+                .aggregate(Vec::<Expr>::new(), vec![avg(col("o3.o_totalprice"))])?
+                .build()?,
+        );
+
+        // Level 2: Middle average (o2)
+        // Correlates to o1.O_ORDERSTATUS and references sq_inner
+        let sq_middle = Arc::new(
+            LogicalPlanBuilder::from(scan_tpch_table("orders"))
+                .alias("o2")?
+                .filter(
+                    col("o2.o_orderstatus")
+                        .eq(out_ref_col(DataType::Utf8, "o1.o_orderstatus"))
+                        .and(col("o2.o_totalprice").gt(scalar_subquery(sq_inner))),
+                )?
+                .aggregate(Vec::<Expr>::new(), vec![avg(col("o2.o_totalprice"))])?
+                .build()?,
+        );
+
+        // Level 1: Outer Query (o1)
+        let plan = LogicalPlanBuilder::from(scan_tpch_table("orders"))
+            .alias("o1")?
+            .filter(col("o1.o_totalprice").gt(scalar_subquery(sq_middle)))?
+            .project(vec![
+                col("o1.o_orderkey"),
+                col("o1.o_totalprice"),
+                col("o1.o_orderstatus"),
+            ])?
+            .build()?;
+
+        println!("Plan: {}", plan.display_indent());
+        Ok(())
+    }
     /// Test for correlated exists subquery less than
     #[test]
     fn exists_subquery_where_less_than() -> Result<()> {
